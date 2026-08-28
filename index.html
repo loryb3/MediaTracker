@@ -323,65 +323,222 @@ const IMG_BACKDROP = 'https://image.tmdb.org/t/p/w780';
 const GENRE_ANIMATION = 16;
 
 /* =========================================================
-   STORAGE (persistent, falls back to in-memory if unavailable)
+   STORAGE — GitHub Gist (cloud sync) + localStorage (cache)
+   
+   Struttura Gist: un singolo Gist privato con tre file:
+     mediatracker-library.json
+     mediatracker-notifications.json
+     mediatracker-settings.json
+   
+   Il Gist ID viene salvato in localStorage dopo la prima creazione.
+   Il token GitHub viene salvato solo in localStorage (mai nel Gist).
 ========================================================= */
 const LS_PREFIX = 'mediatracker:';
-let MEM_FALLBACK = {};
-function hasClaudeStorage(){ return typeof window.storage !== 'undefined' && window.storage; }
-function hasLocalStorage(){
-  try{ const k='__mt_test__'; localStorage.setItem(k,'1'); localStorage.removeItem(k); return true; }
-  catch(e){ return false; }
+const GIST_FILE_LIBRARY      = 'mediatracker-library.json';
+const GIST_FILE_NOTIFICATIONS= 'mediatracker-notifications.json';
+const GIST_FILE_SETTINGS     = 'mediatracker-settings.json';
+const GIST_DESCRIPTION       = 'MediaTracker sync data';
+
+let GITHUB_TOKEN = '';   // Personal Access Token, solo in memoria + localStorage
+let GIST_ID = '';        // ID del Gist, salvato in localStorage
+
+function lsGet(key){ try{ return localStorage.getItem(LS_PREFIX+key); }catch(e){ return null; } }
+function lsSet(key, value){ try{ localStorage.setItem(LS_PREFIX+key, value); }catch(e){} }
+function lsDel(key){ try{ localStorage.removeItem(LS_PREFIX+key); }catch(e){} }
+
+/* Carica token e gist id dal localStorage all'avvio */
+function loadGithubCredentials(){
+  GITHUB_TOKEN = lsGet('githubToken') || '';
+  GIST_ID      = lsGet('gistId')      || '';
 }
-async function storeGet(key){
-  if(hasClaudeStorage()){
-    try{
-      const res = await window.storage.get(key, false);
-      return res ? res.value : null;
-    }catch(e){ /* fall through to localStorage/memory below */ }
-  }
-  if(hasLocalStorage()){
-    try{
-      const v = localStorage.getItem(LS_PREFIX+key);
-      return v !== null ? v : null;
-    }catch(e){ /* read failed despite passing the write test - fall through to memory */ }
-  }
-  return MEM_FALLBACK[key] !== undefined ? MEM_FALLBACK[key] : null;
+
+function saveGithubToken(token){
+  GITHUB_TOKEN = token;
+  lsSet('githubToken', token);
 }
-async function storeSet(key, value){
-  MEM_FALLBACK[key] = value;
-  if(hasClaudeStorage()){
-    try{ await window.storage.set(key, value, false); return; }
-    catch(e){ /* fall through */ }
+
+function saveGistId(id){
+  GIST_ID = id;
+  lsSet('gistId', id);
+}
+
+/* Cancella credenziali (logout) */
+function clearGithubCredentials(){
+  GITHUB_TOKEN = ''; GIST_ID = '';
+  lsDel('githubToken'); lsDel('gistId');
+}
+
+/* Headers comuni per le chiamate GitHub */
+function ghHeaders(){
+  return {
+    'Authorization': 'token '+GITHUB_TOKEN,
+    'Accept': 'application/vnd.github.v3+json',
+    'Content-Type': 'application/json'
+  };
+}
+
+/* Recupera il Gist (tutti e tre i file in una sola chiamata) */
+async function gistFetch(){
+  if(!GIST_ID) return null;
+  const res = await fetch('https://api.github.com/gists/'+GIST_ID, { headers: ghHeaders() });
+  if(res.status === 404){ GIST_ID=''; lsDel('gistId'); return null; }
+  if(!res.ok) throw new Error('GitHub API error '+res.status);
+  return res.json();
+}
+
+/* Crea il Gist la prima volta */
+async function gistCreate(){
+  const body = {
+    description: GIST_DESCRIPTION,
+    public: false,
+    files: {
+      [GIST_FILE_LIBRARY]:       { content: '[]' },
+      [GIST_FILE_NOTIFICATIONS]: { content: '[]' },
+      [GIST_FILE_SETTINGS]:      { content: JSON.stringify({lastCheck:null, tmdbKey:''}) }
+    }
+  };
+  const res = await fetch('https://api.github.com/gists', {
+    method: 'POST', headers: ghHeaders(), body: JSON.stringify(body)
+  });
+  if(!res.ok) throw new Error('Impossibile creare il Gist ('+res.status+')');
+  const data = await res.json();
+  saveGistId(data.id);
+  return data;
+}
+
+/* Aggiorna uno o più file nel Gist */
+async function gistPatch(fileUpdates){
+  if(!GIST_ID) throw new Error('Nessun Gist ID');
+  const files = {};
+  for(const [name, content] of Object.entries(fileUpdates)){
+    files[name] = { content };
   }
-  if(hasLocalStorage()){
-    try{ localStorage.setItem(LS_PREFIX+key, value); }catch(e){ /* quota exceeded or blocked - stays in memory only */ }
-  }
+  const res = await fetch('https://api.github.com/gists/'+GIST_ID, {
+    method: 'PATCH', headers: ghHeaders(), body: JSON.stringify({ files })
+  });
+  if(!res.ok) throw new Error('GitHub PATCH error '+res.status);
+  return res.json();
+}
+
+/* Verifica che il token sia valido */
+async function validateGithubToken(token){
+  const res = await fetch('https://api.github.com/user', {
+    headers: { 'Authorization': 'token '+token, 'Accept': 'application/vnd.github.v3+json' }
+  });
+  if(!res.ok) return null;
+  return res.json(); // restituisce il profilo utente
+}
+
+/* Cerca un Gist esistente di MediaTracker (per ricollegarsi senza creare duplicati) */
+async function findExistingGist(token){
+  const res = await fetch('https://api.github.com/gists?per_page=100', {
+    headers: { 'Authorization': 'token '+token, 'Accept': 'application/vnd.github.v3+json' }
+  });
+  if(!res.ok) return null;
+  const list = await res.json();
+  const found = list.find(g => g.description === GIST_DESCRIPTION && g.files[GIST_FILE_LIBRARY]);
+  return found ? found.id : null;
+}
+
+/* Cache locale: salva una copia in localStorage per accesso immediato al prossimo avvio */
+function cacheLocal(file, content){
+  lsSet('cache:'+file, content);
+}
+function getCached(file){
+  return lsGet('cache:'+file);
+}
+
+/* ---- API pubblica di storage ---- */
+
+let _gistData = null; // cache in memoria del Gist corrente
+
+async function ensureGist(){
+  if(GIST_ID) return;
+  const existing = await findExistingGist(GITHUB_TOKEN);
+  if(existing){ saveGistId(existing); }
+  else { await gistCreate(); }
 }
 
 async function loadLibrary(){
-  const raw = await storeGet('library');
-  if(!raw) return [];
-  try{ return JSON.parse(raw); }catch(e){ return []; }
+  /* Prova prima la cache locale (avvio veloce) */
+  const cached = getCached(GIST_FILE_LIBRARY);
+  let local = [];
+  if(cached){ try{ local = JSON.parse(cached); }catch(e){} }
+
+  if(!GITHUB_TOKEN) return local;
+  try{
+    await ensureGist();
+    _gistData = await gistFetch();
+    if(!_gistData) return local;
+    const raw = _gistData.files[GIST_FILE_LIBRARY] && _gistData.files[GIST_FILE_LIBRARY].content;
+    if(!raw) return local;
+    cacheLocal(GIST_FILE_LIBRARY, raw);
+    return JSON.parse(raw);
+  }catch(e){ console.warn('loadLibrary dal Gist fallito, uso cache:', e); return local; }
 }
-async function saveLibrary(){ await storeSet('library', JSON.stringify(LIB)); }
+
+async function saveLibrary(){
+  const json = JSON.stringify(LIB);
+  cacheLocal(GIST_FILE_LIBRARY, json);
+  if(!GITHUB_TOKEN) return;
+  try{
+    await ensureGist();
+    await gistPatch({ [GIST_FILE_LIBRARY]: json });
+  }catch(e){ console.warn('saveLibrary sul Gist fallito:', e); }
+}
 
 async function loadNotifs(){
-  const raw = await storeGet('notifications');
-  if(!raw) return [];
-  try{ return JSON.parse(raw); }catch(e){ return []; }
+  const cached = getCached(GIST_FILE_NOTIFICATIONS);
+  let local = [];
+  if(cached){ try{ local = JSON.parse(cached); }catch(e){} }
+
+  if(!GITHUB_TOKEN) return local;
+  try{
+    if(!_gistData){ await ensureGist(); _gistData = await gistFetch(); }
+    if(!_gistData) return local;
+    const raw = _gistData.files[GIST_FILE_NOTIFICATIONS] && _gistData.files[GIST_FILE_NOTIFICATIONS].content;
+    if(!raw) return local;
+    cacheLocal(GIST_FILE_NOTIFICATIONS, raw);
+    return JSON.parse(raw);
+  }catch(e){ return local; }
 }
-async function saveNotifs(){ await storeSet('notifications', JSON.stringify(NOTIFS)); }
+
+async function saveNotifs(){
+  const json = JSON.stringify(NOTIFS);
+  cacheLocal(GIST_FILE_NOTIFICATIONS, json);
+  if(!GITHUB_TOKEN) return;
+  try{
+    await ensureGist();
+    await gistPatch({ [GIST_FILE_NOTIFICATIONS]: json });
+  }catch(e){ console.warn('saveNotifs sul Gist fallito:', e); }
+}
 
 async function loadSettings(){
-  const raw = await storeGet('settings');
-  if(!raw) return {lastCheck:null, tmdbKey:''};
+  const defaults = {lastCheck:null, tmdbKey:''};
+  const cached = getCached(GIST_FILE_SETTINGS);
+  let local = defaults;
+  if(cached){ try{ local = {...defaults, ...JSON.parse(cached)}; }catch(e){} }
+
+  if(!GITHUB_TOKEN) return local;
   try{
-    const s = JSON.parse(raw);
-    if(!s.tmdbKey) s.tmdbKey = '';
-    return s;
-  }catch(e){ return {lastCheck:null, tmdbKey:''}; }
+    if(!_gistData){ await ensureGist(); _gistData = await gistFetch(); }
+    if(!_gistData) return local;
+    const raw = _gistData.files[GIST_FILE_SETTINGS] && _gistData.files[GIST_FILE_SETTINGS].content;
+    if(!raw) return local;
+    cacheLocal(GIST_FILE_SETTINGS, raw);
+    return {...defaults, ...JSON.parse(raw)};
+  }catch(e){ return local; }
 }
-async function saveSettings(){ await storeSet('settings', JSON.stringify(SETTINGS)); }
+
+async function saveSettings(){
+  const json = JSON.stringify(SETTINGS);
+  cacheLocal(GIST_FILE_SETTINGS, json);
+  if(!GITHUB_TOKEN) return;
+  try{
+    await ensureGist();
+    await gistPatch({ [GIST_FILE_SETTINGS]: json });
+  }catch(e){ console.warn('saveSettings sul Gist fallito:', e); }
+}
 
 /* =========================================================
    STATE
@@ -882,22 +1039,45 @@ function renderFilmstrip(item){
 /* =========================================================
    RENDER: SHELL
 ========================================================= */
-function renderSetupScreen(errMsg){
+function renderSetupScreen(step, errMsg){
+  // step 1 = GitHub token, step 2 = TMDB key
+  if(step === 2){
+    return '<div class="setup-screen">'+
+      '<div class="setup-logo">MEDIA<span>TRACKER</span></div>'+
+      '<div class="setup-subtitle">Ultimo passo — chiave TMDB</div>'+
+      '<div class="setup-card">'+
+        '<h2>Configura la chiave TMDB</h2>'+
+        '<p>Questo tracker usa <a href="https://www.themoviedb.org/" target="_blank">The Movie Database (TMDB)</a> come fonte dati. La chiave verrà salvata nel tuo Gist insieme ai dati.</p>'+
+        '<ol class="setup-steps">'+
+          '<li>Crea un account gratuito su <a href="https://www.themoviedb.org/signup" target="_blank">themoviedb.org</a></li>'+
+          '<li>Vai su <a href="https://www.themoviedb.org/settings/api" target="_blank">Impostazioni → API</a></li>'+
+          '<li>Richiedi una chiave API (tipo "Developer")</li>'+
+          '<li>Copia la stringa <b>API Key (v3 auth)</b> e incollala qui sotto</li>'+
+        '</ol>'+
+        '<div class="setup-input-row">'+
+          '<input id="setup-key-input" type="text" placeholder="Incolla qui la tua API key v3..." autocomplete="off" spellcheck="false">'+
+          '<button id="setup-save-btn">Salva e avvia</button>'+
+        '</div>'+
+        '<div class="setup-error" id="setup-error">'+(errMsg||'')+'</div>'+
+      '</div>'+
+    '</div>';
+  }
+  // Step 1: GitHub token
   return '<div class="setup-screen">'+
     '<div class="setup-logo">MEDIA<span>TRACKER</span></div>'+
     '<div class="setup-subtitle">Il tuo tracker personale di serie, anime e film</div>'+
     '<div class="setup-card">'+
-      '<h2>Benvenuto — configura la chiave TMDB</h2>'+
-      '<p>Questo tracker usa <a href="https://www.themoviedb.org/" target="_blank">The Movie Database (TMDB)</a> come fonte dati. Per iniziare ti serve una chiave API gratuita.</p>'+
+      '<h2>Benvenuto — collega il tuo account GitHub</h2>'+
+      '<p>I tuoi dati vengono salvati in un <b>Gist privato</b> sul tuo account GitHub, così sono accessibili da qualsiasi dispositivo. Basta un Personal Access Token.</p>'+
       '<ol class="setup-steps">'+
-        '<li>Crea un account gratuito su <a href="https://www.themoviedb.org/signup" target="_blank">themoviedb.org</a></li>'+
-        '<li>Vai su <a href="https://www.themoviedb.org/settings/api" target="_blank">Impostazioni → API</a></li>'+
-        '<li>Richiedi una chiave API (tipo "Developer")</li>'+
-        '<li>Copia la stringa <b>API Key (v3 auth)</b> e incollala qui sotto</li>'+
+        '<li>Vai su <a href="https://github.com/settings/tokens/new" target="_blank">github.com → Settings → Tokens (classic)</a></li>'+
+        '<li>Dai un nome al token, es. <b>MediaTracker</b></li>'+
+        '<li>Spunta solo il permesso <b>gist</b></li>'+
+        '<li>Clicca "Generate token" e copia il token qui sotto</li>'+
       '</ol>'+
       '<div class="setup-input-row">'+
-        '<input id="setup-key-input" type="text" placeholder="Incolla qui la tua API key v3..." autocomplete="off" spellcheck="false">'+
-        '<button id="setup-save-btn">Salva e avvia</button>'+
+        '<input id="setup-gh-input" type="password" placeholder="ghp_..." autocomplete="off" spellcheck="false">'+
+        '<button id="setup-gh-btn">Connetti</button>'+
       '</div>'+
       '<div class="setup-error" id="setup-error">'+(errMsg||'')+'</div>'+
     '</div>'+
@@ -908,8 +1088,27 @@ function renderSettingsView(){
   const keyPreview = SETTINGS.tmdbKey
     ? SETTINGS.tmdbKey.substring(0,4)+'••••••••••••••••••••••••••••'+SETTINGS.tmdbKey.slice(-4)
     : '(nessuna chiave)';
+  const ghPreview = GITHUB_TOKEN
+    ? GITHUB_TOKEN.substring(0,6)+'••••••••••••••••••••••••••••'+GITHUB_TOKEN.slice(-4)
+    : '(non configurato)';
+  const gistLink = GIST_ID
+    ? '<a href="https://gist.github.com/'+GIST_ID+'" target="_blank" style="color:var(--accent);font-size:11px;">Apri Gist ↗</a>'
+    : '<span style="font-size:11px;color:var(--text-faint);">Gist non ancora creato</span>';
+
   return '<div class="settings-section">'+
     '<h2>Impostazioni</h2>'+
+    '<div class="settings-row">'+
+      '<label>Token GitHub (sincronizzazione)</label>'+
+      '<div class="key-display"><span class="key-masked">'+esc(ghPreview)+'</span></div>'+
+      '<div style="margin-bottom:10px;">'+gistLink+'</div>'+
+      '<div class="setup-input-row">'+
+        '<input id="setup-gh-input" type="password" placeholder="Nuovo token ghp_..." autocomplete="off" spellcheck="false">'+
+        '<button id="setup-gh-btn">Aggiorna</button>'+
+      '</div>'+
+      '<div style="margin-top:10px;">'+
+        '<button id="logout-btn" style="background:none;border:1px solid var(--danger);color:var(--danger);font-size:11px;padding:6px 12px;border-radius:6px;font-weight:600;">Disconnetti account</button>'+
+      '</div>'+
+    '</div>'+
     '<div class="settings-row">'+
       '<label>Chiave API TMDB</label>'+
       '<div class="key-display"><span class="key-masked">'+esc(keyPreview)+'</span></div>'+
@@ -923,9 +1122,15 @@ function renderSettingsView(){
 }
 
 function render(){
-  // Se non c'è chiave TMDB, mostra solo la schermata di setup (tranne se siamo già in setup)
+  // Step 1: nessun token GitHub
+  if(!GITHUB_TOKEN){
+    document.getElementById('app').innerHTML = renderSetupScreen(1);
+    attachEvents();
+    return;
+  }
+  // Step 2: GitHub ok ma nessuna chiave TMDB
   if(!TMDB_KEY){
-    document.getElementById('app').innerHTML = renderSetupScreen();
+    document.getElementById('app').innerHTML = renderSetupScreen(2);
     attachEvents();
     return;
   }
@@ -1277,6 +1482,36 @@ function attachEvents(){
     brandStat.onclick = ()=>{ BRAND_STAT_VIEW = (BRAND_STAT_VIEW==='count' ? 'time' : 'count'); render(); };
   }
 
+  /* --- Step 1: GitHub token --- */
+  const setupGhBtn = document.getElementById('setup-gh-btn');
+  if(setupGhBtn){
+    setupGhBtn.onclick = async ()=>{
+      const input = document.getElementById('setup-gh-input');
+      const errEl = document.getElementById('setup-error');
+      const token = (input.value||'').trim();
+      if(!token){ errEl.textContent = 'Incolla il tuo Personal Access Token prima di continuare.'; return; }
+      setupGhBtn.disabled = true; setupGhBtn.textContent = 'Verifica…';
+      try{
+        const profile = await validateGithubToken(token);
+        if(!profile) throw new Error('Token non valido');
+        saveGithubToken(token);
+        // Carica dati dal Gist (se esiste)
+        _gistData = null;
+        LIB      = await loadLibrary();
+        NOTIFS   = await loadNotifs();
+        SETTINGS = await loadSettings();
+        TMDB_KEY = SETTINGS.tmdbKey || '';
+        if(VIEW==='settings') render();
+        else if(TMDB_KEY){ VIEW='library'; render(); checkForUpdates(true).catch(()=>{}); }
+        else render(); // andrà al setup step 2
+      }catch(e){
+        errEl.textContent = 'Token non valido o errore di rete. Controllalo e riprova.';
+        setupGhBtn.disabled = false; setupGhBtn.textContent = VIEW==='settings' ? 'Aggiorna' : 'Connetti';
+      }
+    };
+  }
+
+  /* --- Step 2 / Settings: TMDB key --- */
   const setupSaveBtn = document.getElementById('setup-save-btn');
   if(setupSaveBtn){
     setupSaveBtn.onclick = async ()=>{
@@ -1284,9 +1519,7 @@ function attachEvents(){
       const errEl = document.getElementById('setup-error');
       const key = (input.value||'').trim();
       if(!key){ errEl.textContent = 'Incolla la tua API key prima di continuare.'; return; }
-      // Verifica rapida che la chiave funzioni
-      setupSaveBtn.disabled = true;
-      setupSaveBtn.textContent = 'Verifica…';
+      setupSaveBtn.disabled = true; setupSaveBtn.textContent = 'Verifica…';
       try{
         const testUrl = new URL(TMDB_BASE+'/configuration');
         testUrl.searchParams.set('api_key', key);
@@ -1294,17 +1527,26 @@ function attachEvents(){
         if(!res.ok){ throw new Error('Chiave non valida (status '+res.status+')'); }
       }catch(e){
         errEl.textContent = 'Chiave non valida o errore di rete. Controllala e riprova.';
-        setupSaveBtn.disabled = false;
-        setupSaveBtn.textContent = 'Salva e avvia';
+        setupSaveBtn.disabled = false; setupSaveBtn.textContent = VIEW==='settings' ? 'Aggiorna' : 'Salva e avvia';
         return;
       }
       TMDB_KEY = key;
       SETTINGS.tmdbKey = key;
       await saveSettings();
-      setupSaveBtn.textContent = 'Salva e avvia';
-      setupSaveBtn.disabled = false;
+      setupSaveBtn.disabled = false; setupSaveBtn.textContent = VIEW==='settings' ? 'Aggiorna' : 'Salva e avvia';
       if(VIEW==='settings') render();
       else{ VIEW='library'; render(); checkForUpdates(true).catch(()=>{}); }
+    };
+  }
+
+  /* --- Logout --- */
+  const logoutBtn = document.getElementById('logout-btn');
+  if(logoutBtn){
+    logoutBtn.onclick = ()=>{
+      if(!confirm('Disconnettere l\'account? Il token verrà rimosso da questo dispositivo (i dati nel Gist rimangono intatti).')) return;
+      clearGithubCredentials();
+      LIB=[]; NOTIFS=[]; SETTINGS={lastCheck:null,tmdbKey:''}; TMDB_KEY=''; _gistData=null;
+      VIEW='library'; render();
     };
   }
 
@@ -1470,9 +1712,10 @@ function attachEvents(){
    BOOTSTRAP
 ========================================================= */
 async function boot(){
+  loadGithubCredentials(); // legge token e gist id dal localStorage
   try{
-    LIB = await loadLibrary();
-    NOTIFS = await loadNotifs();
+    LIB      = await loadLibrary();
+    NOTIFS   = await loadNotifs();
     SETTINGS = await loadSettings();
     TMDB_KEY = SETTINGS.tmdbKey || '';
   }catch(e){
